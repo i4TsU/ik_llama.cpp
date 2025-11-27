@@ -1415,6 +1415,9 @@ static void llm_prepare_mla(llama_model & model, int mla) {
             l.wk_b = l.computed_wk_b.get();
             model.tensors_by_name.push_back(std::make_pair(name, l.wk_b));
 
+            printf("Computed %s as %ld x %ld x %ld and stored in buffer %s\n", name.c_str(), wk_b->ne[0], wk_b->ne[1], wk_b->ne[2],
+                    ggml_backend_buffer_name(l.computed_wk_b->buffer));
+
             ggml_graph_clear(graph);
             auto wv_b = ggml_cont(ctx, ggml_view_3d(ctx, &wkv_b, kv_lora_rank, n_embd_head_v, n_head,
                         l.wkv_b->nb[1], l.wkv_b->nb[1]*(n_embd_head_qk_nope + n_embd_head_v), l.wkv_b->nb[1]*n_embd_head_qk_nope));
@@ -1444,8 +1447,8 @@ static void llm_prepare_mla(llama_model & model, int mla) {
             l.wv_b = l.computed_wv_b.get();
             model.tensors_by_name.push_back(std::make_pair(name, l.wv_b));
 
-            printf("Computed %s as %ld x %ld x %ld and stored in buffer %s\n", name.c_str(), wk_b->ne[0], wk_b->ne[1], wk_b->ne[2],
-                    ggml_backend_buffer_name(l.computed_wk_b->buffer));
+            printf("Computed %s as %ld x %ld x %ld and stored in buffer %s\n", name.c_str(), wv_b->ne[0], wv_b->ne[1], wv_b->ne[2],
+                    ggml_backend_buffer_name(l.computed_wv_b->buffer));
 
             ggml_graph_clear(graph);
         }
@@ -4053,66 +4056,53 @@ struct llama_model * llama_load_model_from_file(
     // if no device is specified, all device are included
     // if device is specified, only those in the devices are included in the model->devices
 
-    std::vector<std::string> params_devices = {};
+    std::vector<std::string> params_devices;
     if (params.devices && !striequals(params.devices, "")) {
         params_devices = llama_string_split(params.devices, ",");
         params_devices = extract_ip_from_rpc_device(params_devices);
     }
 
+    std::map<std::string, int32_t> buffer_names;
+    std::vector<std::string> gpu_names;
+    bool has_rpc = params.rpc_servers != nullptr && params.rpc_servers[0] != '\0';
     int32_t idx = 0;
-    if (params_devices.size()) {
-        // just the number of GPU on host machine since we have not added any RPC backend
-        int dev_count = (int)llama_get_device_count(*model);
-        // list all buffer type names
-        std::vector<std::string> buffer_names = {};
-        for (int i = 0; i < dev_count; i++) {
-            ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(*model, i);
-            const char* name = ggml_backend_buft_name(buft);
-            buffer_names.push_back(std::string(name));
-        }
-
-        // add if device matches backend buffer type
-        for (auto device : params_devices) {
-            if (item_in_list(buffer_names, device.c_str())) {
-                idx = find_device_idx(device);
-                model->devices.push_back(idx);
-            } else {
-                LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
-            }
-        }
-    } else {
-        // add all backend buffer to device
-        // just the number of GPU on host machine since we have not added any RPC backend
-        int dev_count = (int)llama_get_device_count(*model);
-        for (idx = 0; idx < dev_count; idx++) {
-            model->devices.push_back(idx);
+    int dev_count = (int)llama_get_device_count(*model);
+    // list all buffer type names
+    for (idx = 0; idx < dev_count; idx++) {
+        ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(*model, idx);
+        const char* name = ggml_backend_buft_name(buft);
+        buffer_names.insert({ std::string(name), idx });
+        gpu_names.push_back(std::string(name));
+    }
+    if (has_rpc) {
+        model->rpc_servers = llama_string_split(params.rpc_servers, ",");
+        for (auto rpc : model->rpc_servers) {
+            buffer_names.insert({ rpc, idx});
+            idx++;
         }
     }
-    if (params.rpc_servers != nullptr && params.rpc_servers[0] != '\0') {
-        if (params_devices.size()) {
-            // just the number of GPU on host machine since we have not added any RPC backend
-            idx = (int)llama_get_device_count(*model); 
-            // split the servers set them into model->rpc_servers
-            std::vector <std::string> rpc_servers = llama_string_split(params.rpc_servers, ",");
-            for (auto device : params_devices) {
-                if (item_in_list(rpc_servers, device.c_str())) {
-                    model->rpc_servers.push_back(device);
-                    model->devices.push_back(idx);
-                    idx++;
-                } else {
-                    LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
-                }
-            }
-        } else {
-                // just number of GPU on host machine since we have not added any RPC backend
-                idx = (int)llama_get_device_count(*model);
-                model->rpc_servers = llama_string_split(params.rpc_servers, ",");
-                for (auto rpc : model->rpc_servers) {
-                    model->devices.push_back(idx);
-                    idx++;
-                }
-         }
-     }
+    std::vector<std::string> device_names;
+    if (params_devices.size()) {
+        device_names = params_devices;
+    }
+    else {
+        // add RPC servers at the front of the list to minimize the network transfers
+        if (has_rpc) {
+            device_names = model->rpc_servers;
+        }
+        device_names.insert(device_names.end(), gpu_names.begin(), gpu_names.end());
+    }
+
+    for (auto & device : device_names) {
+        if (buffer_names.count(device)) {
+            model->devices.push_back(buffer_names[device]);
+        }
+        else {
+            LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
+        }
+    }
+
+ 
     // no gpu used, so set layers offload to be 0
     if (!model->devices.size()) {
         params.n_gpu_layers = 0;

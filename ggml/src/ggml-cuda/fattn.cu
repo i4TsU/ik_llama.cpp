@@ -33,6 +33,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+    const bool head_size_72 = Q->ne[0] == 72 && K->ne[0] == 72 && V->ne[0] == 72;
 
     ggml_tensor local_dst, Kl, Vl, Ml;
     if (n_swa > 0) {
@@ -50,6 +51,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             local_dst.op_params[4] = 0;
             dst = &local_dst;
         }
+    }
+
+    if (head_size_72) {
+        if (precision == GGML_PREC_DEFAULT && fast_fp16_available(cc)) {
+            ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
+        }
+        return;
     }
 
     // On AMD the tile kernels perform poorly, use the vec kernel instead:
@@ -136,6 +146,14 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+    const bool head_size_72 = Q->ne[0] == 72 && K->ne[0] == 72 && V->ne[0] == 72;
+
+    if (head_size_72) {
+        if (precision == GGML_PREC_DEFAULT && fast_fp16_available(cc)) {
+            return ggml_cuda_fattn_tile_f16_is_supported(ctx, dst);
+        }
+        return ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
+    }
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);

@@ -82,6 +82,7 @@ struct llm_build_context {
     const bool fused_up_gate;
     const bool fused_mmad;
     const bool rope_cache;
+    const bool k_cache_hadamard;
     const int  min_experts;
     const float thresh_experts;
 
@@ -159,6 +160,8 @@ struct llm_build_context {
             ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il) const;
 
     ggml_cgraph * build_llama();
+
+    ggml_cgraph * build_mistral3();
 
     ggml_cgraph * build_deci();
 
@@ -405,6 +408,6 @@ llm_expert_gating_func_type   gating_op,
     static ggml_cgraph * llama_build_graph(llama_context & lctx, const llama_batch & batch, bool worst_case);
 
     ggml_tensor * build_std_attention(ggml_cgraph * gf, ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * rope_factors,
-            ggml_tensor * KQ_mask, ggml_tensor * sinks, float KQ_scale, float f_attn_scale, int n_swa, int il);
+            ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale, int n_swa, int il);
 
 };

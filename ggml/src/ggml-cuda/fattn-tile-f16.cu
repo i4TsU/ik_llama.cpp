@@ -75,12 +75,13 @@ static __global__ void flash_attn_tile_ext_f16(
     const float slopef = get_alibi_slope(max_bias, blockIdx.y, n_head_log2, m0, m1);
     const half  slopeh = __float2half(slopef);
 
-    static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
+    constexpr int Dp = (D + 2*WARP_SIZE - 1) & ~(2*WARP_SIZE - 1); // D padded to multiple of 64.
+    constexpr int Dp2 = Dp/2;
 
     __shared__ half KQ[ncols*FATTN_KQ_STRIDE_TILE_F16];
     half2 * KQ2 = (half2 *) KQ;
 
-    __shared__ half2 KV_tmp[FATTN_KQ_STRIDE_TILE_F16][D/2 + 1]; // Pad D to avoid memory bank conflicts.
+    __shared__ half2 KV_tmp[FATTN_KQ_STRIDE_TILE_F16][Dp2 + 1]; // Pad D to avoid memory bank conflicts.
 
     half kqmax[ncols/nwarps];
 #pragma unroll
@@ -89,19 +90,20 @@ static __global__ void flash_attn_tile_ext_f16(
     }
     half2 kqsum[ncols/nwarps] = {{0.0f, 0.0f}};
 
-    half2 VKQ[ncols/nwarps][(D/2)/WARP_SIZE] = {{{0.0f, 0.0f}}};
+    half2 VKQ[ncols/nwarps][Dp2/WARP_SIZE] = {{{0.0f, 0.0f}}};
 
     // Convert Q to half2 and store in registers:
-    __shared__ half2 Q_h2[ncols][D/2];
+    __shared__ half2 Q_h2[ncols][Dp2];
 #pragma unroll
     for (int j0 = 0; j0 < ncols; j0 += nwarps) {
         const int j = j0 + threadIdx.y;
 
 #pragma unroll
-        for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+        for (int i0 = 0; i0 < Dp2; i0 += WARP_SIZE) {
             const int i = i0 + threadIdx.x;
 
-            const float2 tmp = ic0 + j < ne01 ? Q_f2[j*(nb01/sizeof(float2)) + i] : make_float2(0.0f, 0.0f);
+            const bool in_bounds = i < D/2 && ic0 + j < ne01;
+            const float2 tmp = in_bounds ? Q_f2[j*(nb01/sizeof(float2)) + i] : make_float2(0.0f, 0.0f);
             Q_h2[j][i] = make_half2(scale, scale) * make_half2(tmp.x, tmp.y);
         }
     }
@@ -121,12 +123,14 @@ static __global__ void flash_attn_tile_ext_f16(
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < FATTN_KQ_STRIDE_TILE_F16; i_KQ_0 += nwarps) {
             const int i_KQ = i_KQ_0 + threadIdx.y;
+            const bool k_valid = k_VKQ_0 + i_KQ < ne11;
 
 #pragma unroll
-            for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += WARP_SIZE) {
+            for (int k_KQ_0 = 0; k_KQ_0 < Dp2; k_KQ_0 += WARP_SIZE) {
                 const int k_KQ = k_KQ_0 + threadIdx.x;
 
-                KV_tmp[i_KQ][k_KQ] = K_h2[(k_VKQ_0 + i_KQ)*stride_KV2 + k_KQ];
+                const bool load_in_bounds = k_valid && k_KQ < D/2;
+                KV_tmp[i_KQ][k_KQ] = load_in_bounds ? K_h2[(k_VKQ_0 + i_KQ)*stride_KV2 + k_KQ] : make_half2(0.0f, 0.0f);
             }
         }
 
@@ -135,7 +139,7 @@ static __global__ void flash_attn_tile_ext_f16(
         half2 sum2[FATTN_KQ_STRIDE_TILE_F16/WARP_SIZE][ncols/nwarps] = {{{0.0f, 0.0f}}};
 
 #pragma unroll
-        for (int k_KQ = 0; k_KQ < D/2; ++k_KQ) {
+        for (int k_KQ = 0; k_KQ < Dp2; ++k_KQ) {
             half2 K_k[FATTN_KQ_STRIDE_TILE_F16/WARP_SIZE];
             half2 Q_k[ncols/nwarps];
 
@@ -176,7 +180,10 @@ static __global__ void flash_attn_tile_ext_f16(
                 } else {
                     sum = __low2half(sum2[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps]) + __high2half(sum2[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps]);
                 }
-                sum += mask ? slopeh*maskh[j_KQ*ne11 + k_VKQ_0 + i_KQ] : __float2half(0.0f);
+                const bool k_valid = k_VKQ_0 + i_KQ < ne11;
+                const half mask_val = (mask && k_valid) ? slopeh*maskh[j_KQ*ne11 + k_VKQ_0 + i_KQ] : __float2half(0.0f);
+
+                sum = k_valid ? sum + mask_val : -HALF_MAX_HALF;
 
                 kqmax_new[j_KQ_0/nwarps] = ggml_cuda_hmax(kqmax_new[j_KQ_0/nwarps], sum);
 
@@ -205,7 +212,7 @@ static __global__ void flash_attn_tile_ext_f16(
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+            for (int i0 = 0; i0 < Dp2; i0 += WARP_SIZE) {
                 VKQ[j0/nwarps][i0/WARP_SIZE] *= KQ_max_scale;
             }
         }
@@ -215,12 +222,14 @@ static __global__ void flash_attn_tile_ext_f16(
 #pragma unroll
         for (int k0 = 0; k0 < FATTN_KQ_STRIDE_TILE_F16; k0 += nwarps) {
             const int k = k0 + threadIdx.y;
+            const bool k_valid = k_VKQ_0 + k < ne11;
 
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+            for (int i0 = 0; i0 < Dp2; i0 += WARP_SIZE) {
                 const int i = i0 + threadIdx.x;
 
-                KV_tmp[k][i] = V_h2[(k_VKQ_0 + k)*stride_KV2 + i];
+                const bool load_in_bounds = k_valid && i < D/2;
+                KV_tmp[k][i] = load_in_bounds ? V_h2[(k_VKQ_0 + k)*stride_KV2 + i] : make_half2(0.0f, 0.0f);
             }
         }
 
@@ -228,11 +237,11 @@ static __global__ void flash_attn_tile_ext_f16(
 
 #pragma unroll
         for (int k0 = 0; k0 < FATTN_KQ_STRIDE_TILE_F16; k0 += 2) {
-            half2  V_k[(D/2)/WARP_SIZE][2];
+            half2  V_k[Dp2/WARP_SIZE][2];
             half2 KQ_k[ncols/nwarps];
 
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+            for (int i0 = 0; i0 < Dp2; i0 += WARP_SIZE) {
                 const int i = i0 + threadIdx.x;
 
                 V_k[i0/WARP_SIZE][0] = KV_tmp[k0 + 0][i];
@@ -246,7 +255,7 @@ static __global__ void flash_attn_tile_ext_f16(
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+            for (int i0 = 0; i0 < Dp2; i0 += WARP_SIZE) {
 #pragma unroll
                 for (int j0 = 0; j0 < ncols; j0 += nwarps) {
                     VKQ[j0/nwarps][i0/WARP_SIZE] += V_k[i0/WARP_SIZE][0]* __low2half2(KQ_k[j0/nwarps]);
@@ -273,13 +282,17 @@ static __global__ void flash_attn_tile_ext_f16(
         for (int i00 = 0; i00 < D; i00 += 2*WARP_SIZE) {
             const int i0 = i00 + 2*threadIdx.x;
 
-            half2 dst_val = VKQ[j_VKQ_0/nwarps][i0/(2*WARP_SIZE)];
-            if (parallel_blocks == 1) {
-                dst_val /= __half2half2(kqsum_j);
+            if (i0 < D) {
+                half2 dst_val = VKQ[j_VKQ_0/nwarps][i0/(2*WARP_SIZE)];
+                if (parallel_blocks == 1) {
+                    dst_val /= __half2half2(kqsum_j);
+                }
+                const int j_dst = (ic0 + j_VKQ)*parallel_blocks + ip;
+                dst[j_dst*D*gridDim.y + D*blockIdx.y + i0 + 0] =  __low2float(dst_val);
+                if (i0 + 1 < D) {
+                    dst[j_dst*D*gridDim.y + D*blockIdx.y + i0 + 1] = __high2float(dst_val);
+                }
             }
-            const int j_dst = (ic0 + j_VKQ)*parallel_blocks + ip;
-            dst[j_dst*D*gridDim.y + D*blockIdx.y + i0 + 0] =  __low2float(dst_val);
-            dst[j_dst*D*gridDim.y + D*blockIdx.y + i0 + 1] = __high2float(dst_val);
         }
 
         if (parallel_blocks != 1 && threadIdx.x == 0) {
@@ -295,20 +308,29 @@ template <int cols_per_block, int parallel_blocks, bool use_softcap>
 void launch_fattn_tile_f16_64_128(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     switch (Q->ne[0]) {
+        case  72: {
+            constexpr int      D = 72;
+            constexpr int nwarps = 8;
+            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap>;
+            constexpr bool enforce_stride = false;
+            launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true, enforce_stride);
+        } break;
         case  64: {
             constexpr int      D = 64;
             constexpr int nwarps = 8;
             fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap>;
-            launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
+            constexpr bool enforce_stride = true;
+            launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true, enforce_stride);
         } break;
         case 128: {
             constexpr int      D = 128;
             constexpr int nwarps = 8;
             fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap>;
-            launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
+            constexpr bool enforce_stride = true;
+            launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true, enforce_stride);
         } break;
         default: {
-            GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64 and 128.");
+            GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64, 72 and 128.");
         } break;
     }
 }
@@ -358,5 +380,5 @@ bool ggml_cuda_fattn_tile_f16_is_supported([[maybe_unused]] ggml_backend_cuda_co
     auto K = dst->src[1];
     auto V = dst->src[2];
     if (K->ne[0] != V->ne[0]) return false;
-    return K->ne[0] == 64 || K->ne[0] == 128;
+    return K->ne[0] == 64 || K->ne[0] == 72 || K->ne[0] == 128;
 }

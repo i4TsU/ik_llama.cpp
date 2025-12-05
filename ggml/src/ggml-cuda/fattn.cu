@@ -100,6 +100,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // Head size 72 is not supported by WMMA/MMA kernels (requires Dk % 16 == 0 for tensor cores)
+    // Fall back to tile kernels which have specialized support for head size 72
+    if (Q->ne[0] == 72) {
+        if (precision == GGML_PREC_DEFAULT) {
+            ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_tile_f32(ctx, dst);
+        }
+        return;
+    }
+
     //
     // It turns out the new new MMA implementation is slower than the
     // previous MMA implementation.
@@ -174,6 +185,12 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % (2*WARP_SIZE) == 0;
     if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
         return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+    }
+
+    // Head size 72 uses tile kernels (WMMA/MMA don't support it)
+    if (Q->ne[0] == 72) {
+        return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_tile_f16_is_supported(ctx, dst)
+                                              : ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
     }
 
     if (new_mma_available(cc) && (Q->ne[0] == 576 || (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))) {

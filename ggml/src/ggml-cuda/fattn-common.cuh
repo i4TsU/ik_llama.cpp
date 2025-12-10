@@ -741,7 +741,8 @@ static void on_no_fattn_vec_case(const int Dk, const int Dv) {
 template <int Dk, int Dv, int parallel_blocks>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel,
-    const int nwarps, const int cols_per_block, const bool need_f16_K, const bool need_f16_V
+    const int nwarps, const int cols_per_block, const bool need_f16_K, const bool need_f16_V,
+    const bool enforce_kv_stride = true
 ) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -759,7 +760,9 @@ void launch_fattn(
     GGML_ASSERT(!mask || mask->ne[1] >= GGML_PAD(Q->ne[1], 16) &&
                                 "the Flash-Attention CUDA kernel requires the mask to be padded to 16 and at least n_queries big");
 
-    GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && "Incorrect KV cache padding.");
+    if (enforce_kv_stride) {
+        GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && "Incorrect KV cache padding.");
+    }
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
